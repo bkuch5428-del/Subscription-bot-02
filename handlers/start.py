@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, MessageEntity
 
 from database import (
     save_user, save_referral, get_user_referral_info,
@@ -117,21 +117,43 @@ async def _process_new_user(bot: Bot, user_id: int, first_name: str, username: s
 
 # ── Start demo video sender ───────────────────────────────────────────────────
 
-async def _copy_demo_messages(bot: Bot, chat_id: int, source: str, msg_ids: list[int]) -> list[int]:
+async def _send_demo_messages(bot: Bot, chat_id: int, source: str, msg_ids: list[int], media: list[dict]) -> list[int]:
     sent_ids: list[int] = []
-    try:
-        copied = await bot.copy_messages(chat_id=chat_id, from_chat_id=source, message_ids=msg_ids)
-        sent_ids.extend(item.message_id for item in copied)
+    if not isinstance(msg_ids, list) or not isinstance(media, list) or len(media) != len(msg_ids) or any(
+        not isinstance(item, dict)
+        or item.get("message_id") != message_id
+        or item.get("type") not in {"video", "copy"}
+        or (item.get("type") == "video" and not item.get("file_id"))
+        for message_id, item in zip(msg_ids, media)
+    ):
+        logger.error("Demo media metadata is incomplete or out of order; refusing delivery")
         return sent_ids
-    except Exception:
-        logger.exception("copy_messages() failed — falling back to individual sends")
 
-    for message_id in msg_ids:
+    for item in media:
+        message_id = item["message_id"]
         try:
-            copied = await bot.copy_message(chat_id=chat_id, from_chat_id=source, message_id=message_id)
-            sent_ids.append(copied.message_id)
+            if item["type"] == "video":
+                caption_entities = [
+                    MessageEntity(**entity)
+                    for entity in item.get("caption_entities", [])
+                ]
+                sent = await bot.send_video(
+                    chat_id=chat_id,
+                    video=item["file_id"],
+                    has_spoiler=True,
+                    caption=item.get("caption"),
+                    caption_entities=caption_entities or None,
+                    parse_mode=None,
+                )
+            else:
+                sent = await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=source,
+                    message_id=message_id,
+                )
+            sent_ids.append(sent.message_id)
         except Exception:
-            logger.exception("Failed to copy message %s from channel %s", message_id, source)
+            logger.exception("Failed to send demo message %s from channel %s", message_id, source)
         await asyncio.sleep(0.25)
     return sent_ids
 
@@ -153,9 +175,14 @@ async def send_start_demo_videos(bot: Bot, chat_id: int, user_id: int) -> None:
 
     source  = cfg["source"]
     msg_ids = cfg["ids"]
+    media = cfg.get("media", [])
+    if not media:
+        logger.warning("Start demo IDs are legacy records; re-save them before spoiler-safe delivery")
+        return
+    source = cfg.get("media_source") or source
 
     session_id = await create_demo_session(user_id)
-    sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
+    sent_ids = await _send_demo_messages(bot, chat_id, source, msg_ids, media)
     if sent_ids:
         await activate_demo_session(session_id, sent_ids, datetime.now(timezone.utc) + timedelta(minutes=10))
     else:
@@ -170,18 +197,21 @@ async def send_start_demo_videos(bot: Bot, chat_id: int, user_id: int) -> None:
 
 async def send_demo_videos(bot: Bot, chat_id: int, user_id: int, plan: dict) -> tuple[str, list[int]] | None:
     """
-    Copy demo messages from the plan's source channel to the user.
-    Stores only message IDs — no media is downloaded locally.
+    Send ordered demo media from the plan to the user without downloading media.
     """
     source = plan.get("source_channel_id", "")
     msg_ids = plan.get("demo_message_ids", [])
+    media = plan.get("demo_media", [])
 
     if not source or not msg_ids:
         logger.warning("Plan id=%s has no demo videos configured.", plan.get("id"))
         return
+    if not media:
+        logger.warning("Plan id=%s has legacy demo IDs; re-save them before spoiler-safe delivery.", plan.get("id"))
+        return
 
     session_id = await create_demo_session(user_id)
-    sent_ids = await _copy_demo_messages(bot, chat_id, source, msg_ids)
+    sent_ids = await _send_demo_messages(bot, chat_id, source, msg_ids, media)
     if sent_ids:
         return session_id, sent_ids
     await discard_demo_session(session_id)

@@ -44,6 +44,7 @@ from database import (
     set_setting,
     get_start_demo,
     set_start_demo_ids,
+    save_plan_demo_media,
     move_plan_up,
     move_plan_down,
     move_plan_to_top,
@@ -87,7 +88,7 @@ _STEPS_LABEL = {
     "add:validity": "⏳ Enter validity (e.g. 30 Days):",
     "add:demo":     (
         "🎥 <b>Forward</b> demo messages from the source channel.\n\n"
-        "Go to your source channel → select messages → forward them here.\n"
+        "Forward each message here in the order users should see them.\n"
         "When you're done, click <b>✅ Done</b> below."
     ),
     "add:access":   "🔗 Enter the access link (channel/group invite URL):",
@@ -105,6 +106,23 @@ EDIT_FIELD_LABELS = {
 
 def _is_admin(user_id: int) -> bool:
     return is_admin_user(user_id)
+
+
+def _demo_media_record(message: Message, message_id: int) -> dict:
+    video = getattr(message, "video", None)
+    if not video:
+        return {"message_id": message_id, "type": "copy"}
+    caption_entities = [
+        entity.model_dump(mode="json", exclude_none=True)
+        for entity in (getattr(message, "caption_entities", None) or [])
+    ]
+    return {
+        "message_id": message_id,
+        "type": "video",
+        "file_id": video.file_id,
+        "caption": getattr(message, "caption", None),
+        "caption_entities": caption_entities,
+    }
 
 
 def _user_contact_link(user: dict) -> str:
@@ -817,6 +835,7 @@ async def add_step_demo_media(message: Message) -> None:
         return
 
     st["data"]["demo_ids"].append(fwd_id)
+    st["data"].setdefault("demo_media", []).append(_demo_media_record(message, fwd_id))
     # Store (or confirm) the source channel ID from the first forwarded message.
     if not st["data"].get("source_channel_id"):
         st["data"]["source_channel_id"] = str(fwd_chat.id)
@@ -867,11 +886,20 @@ async def cb_demo_done(call: CallbackQuery) -> None:
                 "⚠️ No demo videos captured yet. Please forward at least one message from the source channel."
             )
             return
-        update_kwargs: dict = {"demo_message_ids": new_ids}
+        new_media = st["data"].get("demo_media", [])
         # If forwarded messages reveal a source channel, update it too.
-        if st["data"].get("source_channel_id"):
-            update_kwargs["source_channel_id"] = st["data"]["source_channel_id"]
-        await update_plan(plan_id, **update_kwargs)
+        source = st["data"].get("source_channel_id")
+        plan = await get_plan(plan_id)
+        source = source or (plan or {}).get("source_channel_id", "")
+        try:
+            await save_plan_demo_media(plan_id, new_ids, source, new_media)
+        except Exception:
+            logger.exception("Failed to save verified demo media for plan %s", plan_id)
+            await call.message.answer(
+                "⚠️ The new demo set could not be verified. The previous saved set was kept; "
+                "please retry saving the forwarded messages."
+            )
+            return
         _state.pop(call.from_user.id, None)
         count = len(new_ids)
         await call.message.answer(
@@ -907,7 +935,7 @@ async def cb_save_plan(call: CallbackQuery) -> None:
     if not _is_admin(call.from_user.id):
         await call.answer("⛔ Unauthorised.", show_alert=True)
         return
-    st = _state.pop(call.from_user.id, None)
+    st = _state.get(call.from_user.id)
     if not st or st["step"] != "add:confirm":
         await call.answer("No plan to save.", show_alert=True)
         return
@@ -916,14 +944,24 @@ async def cb_save_plan(call: CallbackQuery) -> None:
     # Use the source channel resolved from forwarded demo messages;
     # fall back to the global SOURCE_CHANNEL_ID from config.
     source = d.get("resolved_source_channel") or SOURCE_CHANNEL_ID
-    await create_plan(
-        name=d["name"],
-        price=d["price"],
-        validity=d["validity"],
-        demo_message_ids=d.get("demo_ids", []),
-        source_channel_id=source,
-        access_link=d["access_link"],
-    )
+    try:
+        await create_plan(
+            name=d["name"],
+            price=d["price"],
+            validity=d["validity"],
+            demo_message_ids=d.get("demo_ids", []),
+            source_channel_id=source,
+            access_link=d["access_link"],
+            demo_media=d.get("demo_media", []),
+        )
+    except Exception:
+        logger.exception("Failed to save plan %r with its demo metadata", d.get("name"))
+        await call.message.answer(
+            "⚠️ The plan and demo metadata could not be saved. Your forwarded selection is still here; "
+            "please retry saving."
+        )
+        return
+    _state.pop(call.from_user.id, None)
     await call.message.edit_text(
         f"✅ Plan <b>{d['name']}</b> saved successfully!",
         reply_markup=admin_panel_keyboard(),
@@ -1170,8 +1208,8 @@ async def cb_demo_plan_selected(call: CallbackQuery) -> None:
     }
     await call.message.edit_text(
         f"🎥 <b>Change Demo Videos: {plan['name']}</b>\n\n"
-        "Send the new demo videos (photos/videos) one by one or as an album.\n"
-        "Click <b>✅ Done</b> when finished. This will replace the old demo videos.",
+        "Forward each source message here in the order users should see them.\n"
+        "The saved set changes only after you click <b>✅ Done</b>.",
         reply_markup=admin_demo_done_keyboard(0),
     )
 
@@ -1197,6 +1235,7 @@ async def handle_demo_videos_media(message: Message) -> None:
         return
 
     st["data"]["demo_ids"].append(fwd_id)
+    st["data"].setdefault("demo_media", []).append(_demo_media_record(message, fwd_id))
     if not st["data"].get("source_channel_id"):
         st["data"]["source_channel_id"] = str(fwd_chat.id)
 
@@ -1283,7 +1322,7 @@ async def cb_sd_change(call: CallbackQuery) -> None:
         await call.message.edit_text(
             "📹 <b>Change Start Demo Videos</b>\n\n"
             f"Forward the start demo videos from the configured Demo Videos Channel "
-            f"(<code>{SOURCE_CHANNEL_ID}</code>).\n\n"
+            f"(<code>{SOURCE_CHANNEL_ID}</code>) in the order users should see them.\n\n"
             "When finished, press <b>✅ Done</b>.",
             reply_markup=start_demo_done_keyboard(0),
         )
@@ -1291,7 +1330,7 @@ async def cb_sd_change(call: CallbackQuery) -> None:
         await call.message.answer(
             "📹 <b>Change Start Demo Videos</b>\n\n"
             f"Forward the start demo videos from the configured Demo Videos Channel "
-            f"(<code>{SOURCE_CHANNEL_ID}</code>).\n\n"
+            f"(<code>{SOURCE_CHANNEL_ID}</code>) in the order users should see them.\n\n"
             "When finished, press <b>✅ Done</b>.",
             reply_markup=start_demo_done_keyboard(0),
         )
@@ -1337,6 +1376,7 @@ async def handle_startdemo_media(message: Message) -> None:
         return
 
     st["data"]["demo_ids"].append(fwd_id)
+    st["data"].setdefault("demo_media", []).append(_demo_media_record(message, fwd_id))
     if not st["data"].get("source_channel_id"):
         st["data"]["source_channel_id"] = str(fwd_chat.id)
 
@@ -1370,10 +1410,19 @@ async def cb_sd_done(call: CallbackQuery) -> None:
         return
 
     source = st["data"].get("source_channel_id") or SOURCE_CHANNEL_ID
-    _state.pop(call.from_user.id, None)
     await call.answer()
 
-    await set_start_demo_ids(ids, source)
+    media = st["data"].get("demo_media", [])
+    try:
+        await set_start_demo_ids(ids, source, media)
+    except Exception:
+        logger.exception("Failed to save verified start demo media")
+        await call.message.answer(
+            "⚠️ The new start demo set could not be verified. The previous saved set was kept; "
+            "please retry saving the forwarded messages."
+        )
+        return
+    _state.pop(call.from_user.id, None)
     count = len(ids)
     await call.message.edit_text(
         f"✅ <b>Start demo videos updated!</b>\n\n"

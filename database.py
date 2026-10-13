@@ -162,6 +162,7 @@ async def init_db() -> None:
         ("start_demo_enabled",       "0"),  # disabled until admin explicitly enables
         ("start_demo_ids",           "[]"), # JSON-encoded list of message IDs
         ("start_demo_source",        ""),   # source channel for start demo videos
+        ("start_demo_media",         ""),   # verified source message metadata for spoiler delivery
         ("reminder_enabled",         "1"),  # abandoned-payment reminders on by default
         ("reminder_first_delay_min", "15"),
         ("reminder_second_delay_min", "1440"),  # 24 hours
@@ -656,6 +657,7 @@ def _plan_doc_to_dict(doc: dict) -> dict:
         "price":              doc.get("price", ""),
         "validity":           doc.get("validity", ""),
         "demo_message_ids":   doc.get("demo_message_ids", []),
+        "demo_media":         doc.get("demo_media", []),
         "source_channel_id":  doc.get("source_channel_id", ""),
         "access_link":        doc.get("access_link", ""),
         "buy_message":        doc.get("buy_message", ""),
@@ -690,8 +692,11 @@ async def create_plan(
     demo_message_ids: list[int],
     source_channel_id: str,
     access_link: str,
+    demo_media: list[dict] | None = None,
 ) -> int:
     """Insert a new plan, appended to the end of the display order. Returns the new plan's id."""
+    if demo_media is not None:
+        _validate_demo_media_records(demo_message_ids, demo_media)
     plan_id = await _next_plan_id()
     sort_order = await _next_plan_sort_order()
     await _plans.insert_one({
@@ -700,6 +705,7 @@ async def create_plan(
         "price":             price,
         "validity":          validity,
         "demo_message_ids":  list(demo_message_ids or []),
+        "demo_media":        list(demo_media or []),
         "source_channel_id": source_channel_id,
         "access_link":       access_link,
         "sort_order":        sort_order,
@@ -732,9 +738,83 @@ async def update_plan(plan_id: int, **fields) -> None:
     """Update any subset of plan fields."""
     if "demo_message_ids" in fields:
         fields["demo_message_ids"] = list(fields["demo_message_ids"] or [])
+    if "demo_media" in fields:
+        fields["demo_media"] = list(fields["demo_media"] or [])
     if fields:
         await _plans.update_one({"_id": plan_id}, {"$set": fields})
     logger.info("Updated plan id=%s fields=%s", plan_id, list(fields.keys()))
+
+
+def _validate_demo_media_records(demo_message_ids: list[int], demo_media: list[dict]) -> None:
+    if not isinstance(demo_message_ids, list) or not isinstance(demo_media, list):
+        raise ValueError("Demo IDs and metadata must be lists")
+    if len(demo_message_ids) != len(demo_media) or any(
+        not isinstance(item, dict)
+        or item.get("message_id") != message_id
+        or item.get("type") not in {"video", "copy"}
+        or (item.get("type") == "video" and not item.get("file_id"))
+        for message_id, item in zip(demo_message_ids, demo_media)
+    ):
+        raise ValueError("Demo media metadata must match the ordered message IDs")
+
+
+async def save_plan_demo_media(
+    plan_id: int,
+    demo_message_ids: list[int],
+    source_channel_id: str,
+    demo_media: list[dict],
+) -> None:
+    """Stage and verify new demo metadata before atomically replacing the active set."""
+    ids = list(demo_message_ids or [])
+    media = list(demo_media or [])
+    _validate_demo_media_records(ids, media)
+    pending_fields = {
+        "demo_message_ids_pending": ids,
+        "demo_media_pending": media,
+        "source_channel_id_pending": source_channel_id,
+    }
+    staged = await _plans.update_one({"_id": plan_id}, {"$set": pending_fields})
+    if not staged.matched_count:
+        raise ValueError(f"Plan id={plan_id} does not exist")
+
+    pending = await _plans.find_one(
+        {"_id": plan_id},
+        {"demo_message_ids_pending": 1, "demo_media_pending": 1, "source_channel_id_pending": 1},
+    )
+    if (
+        not pending
+        or pending.get("demo_message_ids_pending") != ids
+        or pending.get("demo_media_pending") != media
+        or pending.get("source_channel_id_pending") != source_channel_id
+    ):
+        raise RuntimeError(f"Plan id={plan_id} demo metadata could not be verified")
+
+    await _plans.update_one(
+        {"_id": plan_id},
+        {
+            "$set": {
+                "demo_message_ids": ids,
+                "demo_media": media,
+                "source_channel_id": source_channel_id,
+            },
+            "$unset": {
+                "demo_message_ids_pending": "",
+                "demo_media_pending": "",
+                "source_channel_id_pending": "",
+            },
+        },
+    )
+    active = await _plans.find_one(
+        {"_id": plan_id},
+        {"demo_message_ids": 1, "demo_media": 1, "source_channel_id": 1},
+    )
+    if (
+        not active
+        or active.get("demo_message_ids") != ids
+        or active.get("demo_media") != media
+        or active.get("source_channel_id") != source_channel_id
+    ):
+        raise RuntimeError(f"Plan id={plan_id} active demo metadata could not be verified")
 
 
 async def toggle_plan_visibility(plan_id: int) -> dict | None:
@@ -830,12 +910,13 @@ async def move_plan_to_bottom(plan_id: int) -> bool:
 # ── Start Demo Videos ─────────────────────────────────────────────────────────
 
 async def get_start_demo() -> dict:
-    """Return start demo config: {enabled: bool, ids: list[int], source: str}."""
+    """Return start demo config, including verified media metadata when available."""
     import json
-    enabled_value, raw_ids, source = await asyncio.gather(
+    enabled_value, raw_ids, source, raw_media = await asyncio.gather(
         get_setting("start_demo_enabled"),
         get_setting("start_demo_ids"),
         get_setting("start_demo_source"),
+        get_setting("start_demo_media"),
     )
     enabled = enabled_value == "1"
     raw_ids = raw_ids or "[]"
@@ -844,14 +925,45 @@ async def get_start_demo() -> dict:
         ids = [int(x) for x in json.loads(raw_ids)]
     except Exception:
         ids = []
-    return {"enabled": enabled, "ids": ids, "source": source}
+    try:
+        media_config = json.loads(raw_media) if raw_media else {}
+        media = media_config.get("items", []) if isinstance(media_config, dict) else []
+        media_source = media_config.get("source", "") if isinstance(media_config, dict) else ""
+        configured_ids = media_config.get("ids") if isinstance(media_config, dict) else None
+        if isinstance(configured_ids, list):
+            ids = configured_ids
+            source = media_source
+        if not isinstance(media, list):
+            media = []
+    except Exception:
+        media = []
+        media_source = ""
+    return {
+        "enabled": enabled,
+        "ids": ids,
+        "source": source,
+        "media": media,
+        "media_source": media_source,
+    }
 
 
-async def set_start_demo_ids(ids: list[int], source_channel_id: str) -> None:
-    """Persist the start demo message IDs and their source channel."""
+async def set_start_demo_ids(ids: list[int], source_channel_id: str, media: list[dict]) -> None:
+    """Verify new start-demo metadata before activating it or replacing legacy IDs."""
     import json
-    await set_setting("start_demo_ids", json.dumps(ids))
-    await set_setting("start_demo_source", source_channel_id)
+    _validate_demo_media_records(ids, media)
+    media_payload = json.dumps({
+        "ids": list(ids),
+        "source": source_channel_id,
+        "items": list(media or []),
+    })
+    await set_setting("start_demo_media_pending", media_payload)
+    if await get_setting("start_demo_media_pending") != media_payload:
+        raise RuntimeError("Start demo media metadata could not be verified")
+    pending_config = json.loads(await get_setting("start_demo_media_pending"))
+    _validate_demo_media_records(pending_config.get("ids"), pending_config.get("items"))
+    await set_setting("start_demo_media", media_payload)
+    if await get_setting("start_demo_media") != media_payload:
+        raise RuntimeError("Start demo media metadata could not be activated")
 
 
 async def delete_plan(plan_id: int) -> None:
