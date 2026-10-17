@@ -6,7 +6,13 @@ from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, Bot
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, MessageEntity
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InputMediaPhoto,
+    InputMediaVideo,
+    MessageEntity,
+)
 
 from database import (
     save_user, save_referral, get_user_referral_info,
@@ -122,39 +128,105 @@ async def _send_demo_messages(bot: Bot, chat_id: int, source: str, msg_ids: list
     if not isinstance(msg_ids, list) or not isinstance(media, list) or len(media) != len(msg_ids) or any(
         not isinstance(item, dict)
         or item.get("message_id") != message_id
-        or item.get("type") not in {"video", "copy"}
-        or (item.get("type") == "video" and not item.get("file_id"))
+        or item.get("type") not in {"video", "photo", "copy"}
+        or (item.get("type") in {"video", "photo"} and not item.get("file_id"))
+        or (item.get("type") == "copy" and item.get("copy_safe") is not True)
         for message_id, item in zip(msg_ids, media)
     ):
         logger.error("Demo media metadata is incomplete or out of order; refusing delivery")
         return sent_ids
 
-    for item in media:
+    def caption_kwargs(item: dict) -> dict:
+        entities = [MessageEntity(**entity) for entity in item.get("caption_entities", [])]
+        return {
+            "caption": item.get("caption"),
+            "caption_entities": entities or None,
+            "parse_mode": None,
+        }
+
+    def input_media(item: dict) -> InputMediaPhoto | InputMediaVideo:
+        kwargs = {
+            "media": item["file_id"],
+            "has_spoiler": True,
+            **caption_kwargs(item),
+        }
+        if item["type"] == "photo":
+            return InputMediaPhoto(**kwargs)
+        return InputMediaVideo(**kwargs)
+
+    async def send_single(item: dict):
+        common = caption_kwargs(item)
+        if item["type"] == "video":
+            return await bot.send_video(
+                chat_id=chat_id,
+                video=item["file_id"],
+                has_spoiler=True,
+                **common,
+            )
+        if item["type"] == "photo":
+            return await bot.send_photo(
+                chat_id=chat_id,
+                photo=item["file_id"],
+                has_spoiler=True,
+                **common,
+            )
+        return await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=source,
+            message_id=item["message_id"],
+        )
+
+    index = 0
+    while index < len(media):
+        item = media[index]
         message_id = item["message_id"]
+        group_id = item.get("media_group_id")
+        group_end = index + 1
+        if group_id and item["type"] in {"photo", "video"}:
+            while (
+                group_end < len(media)
+                and media[group_end].get("media_group_id") == group_id
+                and media[group_end].get("type") in {"photo", "video"}
+            ):
+                group_end += 1
+
+        if group_end - index >= 2:
+            for chunk_start in range(index, group_end, 10):
+                chunk = media[chunk_start:min(chunk_start + 10, group_end)]
+                if len(chunk) == 1:
+                    try:
+                        sent = await send_single(chunk[0])
+                        sent_ids.append(sent.message_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to send demo message %s from channel %s",
+                            chunk[0]["message_id"],
+                            source,
+                        )
+                else:
+                    try:
+                        sent_messages = await bot.send_media_group(
+                            chat_id=chat_id,
+                            media=[input_media(group_item) for group_item in chunk],
+                        )
+                        sent_ids.extend(sent.message_id for sent in sent_messages)
+                    except Exception:
+                        logger.exception(
+                            "Failed to send demo media group starting at message %s from channel %s",
+                            chunk[0]["message_id"],
+                            source,
+                        )
+                await asyncio.sleep(0.25)
+            index = group_end
+            continue
+
         try:
-            if item["type"] == "video":
-                caption_entities = [
-                    MessageEntity(**entity)
-                    for entity in item.get("caption_entities", [])
-                ]
-                sent = await bot.send_video(
-                    chat_id=chat_id,
-                    video=item["file_id"],
-                    has_spoiler=True,
-                    caption=item.get("caption"),
-                    caption_entities=caption_entities or None,
-                    parse_mode=None,
-                )
-            else:
-                sent = await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=source,
-                    message_id=message_id,
-                )
+            sent = await send_single(item)
             sent_ids.append(sent.message_id)
         except Exception:
             logger.exception("Failed to send demo message %s from channel %s", message_id, source)
         await asyncio.sleep(0.25)
+        index += 1
     return sent_ids
 
 

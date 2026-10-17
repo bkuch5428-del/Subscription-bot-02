@@ -110,19 +110,34 @@ def _is_admin(user_id: int) -> bool:
 
 def _demo_media_record(message: Message, message_id: int) -> dict:
     video = getattr(message, "video", None)
-    if not video:
-        return {"message_id": message_id, "type": "copy"}
+    photos = getattr(message, "photo", None)
+    media_group_id = getattr(message, "media_group_id", None)
+    if video:
+        media_type = "video"
+        file_id = video.file_id
+    elif photos:
+        media_type = "photo"
+        file_id = photos[-1].file_id
+    else:
+        record = {"message_id": message_id, "type": "copy", "copy_safe": True}
+        if media_group_id is not None:
+            record["media_group_id"] = media_group_id
+        return record
+
     caption_entities = [
         entity.model_dump(mode="json", exclude_none=True)
         for entity in (getattr(message, "caption_entities", None) or [])
     ]
-    return {
+    record = {
         "message_id": message_id,
-        "type": "video",
-        "file_id": video.file_id,
+        "type": media_type,
+        "file_id": file_id,
         "caption": getattr(message, "caption", None),
         "caption_entities": caption_entities,
     }
+    if media_group_id is not None:
+        record["media_group_id"] = media_group_id
+    return record
 
 
 def _user_contact_link(user: dict) -> str:
