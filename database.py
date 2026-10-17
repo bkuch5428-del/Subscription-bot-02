@@ -751,8 +751,9 @@ def _validate_demo_media_records(demo_message_ids: list[int], demo_media: list[d
     if len(demo_message_ids) != len(demo_media) or any(
         not isinstance(item, dict)
         or item.get("message_id") != message_id
-        or item.get("type") not in {"video", "copy"}
-        or (item.get("type") == "video" and not item.get("file_id"))
+        or item.get("type") not in {"video", "photo", "copy"}
+        or (item.get("type") in {"video", "photo"} and not item.get("file_id"))
+        or (item.get("type") == "copy" and item.get("copy_safe") is not True)
         for message_id, item in zip(demo_message_ids, demo_media)
     ):
         raise ValueError("Demo media metadata must match the ordered message IDs")
