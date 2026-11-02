@@ -1112,6 +1112,34 @@ async def update_order_status(order_id: str, status: str) -> bool:
     return result.modified_count == 1
 
 
+async def mark_manual_proof_submitted(order_id: str, user_id: int) -> bool:
+    """Atomically move a live manual order into screenshot review."""
+    now = datetime.now(timezone.utc)
+    query = {
+        "_id": order_id,
+        "user_id": user_id,
+        "payment_provider": "manual",
+        "payment_status": {"$in": ["created", "pending"]},
+        "$or": [
+            {"expires_at": None},
+            {"expires_at": {"$exists": False}},
+            {"expires_at": {"$gt": now}},
+        ],
+    }
+    result = await _orders.find_one_and_update(
+        query,
+        {"$set": {
+            "payment_status": "pending",
+            "manual_proof_submitted_at": now,
+            "expiry_notified": False,
+        }},
+        return_document=True,
+    )
+    if result:
+        logger.info("Manual proof submitted order_id=%s user_id=%s", order_id, user_id)
+    return result is not None
+
+
 async def expire_due_orders(now: datetime | None = None) -> list[dict]:
     """Atomically expire live orders and return their stored message IDs."""
     now = now or datetime.now(timezone.utc)
@@ -1119,11 +1147,16 @@ async def expire_due_orders(now: datetime | None = None) -> list[dict]:
         {
             "payment_status": {"$in": ["created", "pending"]},
             "expires_at": {"$lte": now},
+            "$or": [
+                {"payment_provider": {"$ne": "manual"}},
+                {"payment_status": "created"},
+            ],
         },
         {
             "_id": 1,
             "user_id": 1,
             "plan_id": 1,
+            "payment_provider": 1,
             "qr_message_id": 1,
             "payment_message_id": 1,
         },
@@ -1132,7 +1165,14 @@ async def expire_due_orders(now: datetime | None = None) -> list[dict]:
     expired = []
     for doc in due:
         result = await _orders.update_one(
-            {"_id": doc["_id"], "payment_status": {"$in": ["created", "pending"]}},
+            {
+                "_id": doc["_id"],
+                "payment_status": {"$in": ["created", "pending"]},
+                "$or": [
+                    {"payment_provider": {"$ne": "manual"}},
+                    {"payment_status": "created"},
+                ],
+            },
             {"$set": {"payment_status": "expired", "expiry_notified": False}},
         )
         if result.modified_count:
@@ -1194,6 +1234,7 @@ async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> d
                 {"expires_at": {"$gt": datetime.now(timezone.utc)}},
                 {"expires_at": {"$exists": False}},
                 {"expires_at": None},
+                {"payment_provider": "manual", "payment_status": "pending"},
             ],
         },
         {
@@ -1243,7 +1284,12 @@ async def approve_order(
     query = {
         "_id": order_id,
         "payment_status": {"$in": ["created", "pending"]} if allow_created else "pending",
-        "$or": [{"expires_at": None}, {"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
+        "$or": [
+            {"expires_at": None},
+            {"expires_at": {"$exists": False}},
+            {"expires_at": {"$gt": now}},
+            {"payment_provider": "manual", "payment_status": "pending"},
+        ],
     }
     if expected_user_id is not None:
         query["user_id"] = expected_user_id

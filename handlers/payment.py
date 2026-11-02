@@ -70,6 +70,7 @@ from database import (
     cancel_start_reminders,
     update_order_messages,
     update_order_status_message,
+    mark_manual_proof_submitted,
     supersede_active_orders,
     save_provider_response_summary,
 )
@@ -2289,8 +2290,8 @@ async def handle_proof_photo(message: Message, bot: Bot) -> None:
         await message.answer("⚠️ This payment order has expired. Please start a new payment.")
         return
 
-    # Mark order as pending (awaiting manual review)
-    if not await update_order_status(order_id, "pending"):
+    # Mark order as pending (awaiting manual review) and timestamp the screenshot.
+    if not await mark_manual_proof_submitted(order_id, user.id):
         logger.warning("Manual proof rejected user_id=%s order_id=%s reason=pending_transition_failed", user.id, order_id)
         await message.answer("⚠️ This payment order is no longer available. Please start a new payment.")
         return
