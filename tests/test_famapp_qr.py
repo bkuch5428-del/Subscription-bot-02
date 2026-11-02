@@ -131,15 +131,15 @@ class FamAppQrTests(unittest.TestCase):
             payment._waiting_proof[user.id] = order["order_id"]
             with (
                 patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
-                patch.object(payment, "update_order_status", new=AsyncMock(return_value=True)) as update_status,
+                patch.object(payment, "mark_manual_proof_submitted", new=AsyncMock(return_value=True)) as submit_status,
                 patch.object(payment, "LOG_CHANNEL_ID", 999),
             ):
                 bot.send_photo = AsyncMock()
                 await payment.handle_proof_photo(message, bot)
-            return update_status
+            return submit_status
 
-        update_status = asyncio.run(submit_proof())
-        update_status.assert_awaited_once_with(order["order_id"], "pending")
+        submit_status = asyncio.run(submit_proof())
+        submit_status.assert_awaited_once_with(order["order_id"], user.id)
         bot.send_photo.assert_awaited_once()
         message.answer.assert_awaited_once()
 
