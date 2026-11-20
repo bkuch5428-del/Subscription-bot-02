@@ -724,19 +724,13 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
         or stored_plan_amount
         or "0"
     )
-    expected_amount = Decimal(str(stored_final_qr_amount)).quantize(Decimal("0.01"))
     try:
-        supplied_amount = Decimal(str(amount or "0")).quantize(Decimal("0.01"))
-    except (InvalidOperation, ValueError):
-        logger.warning("FamApp verification rejected order_id=%s reason=invalid_supplied_amount amount=%r", order_id, amount)
-        return "failed"
-    if supplied_amount != expected_amount:
-        logger.warning(
-            "FamApp verification rejected order_id=%s reason=amount_mismatch expected=%s supplied=%s",
-            order_id,
-            expected_amount,
-            supplied_amount,
-        )
+        stored_final_decimal = Decimal(str(stored_final_qr_amount))
+        expected_amount = stored_final_decimal.quantize(Decimal("0.01"))
+        if stored_final_decimal != expected_amount:
+            raise InvalidOperation
+    except (InvalidOperation, TypeError, ValueError):
+        logger.warning("FamApp verification rejected order_id=%s reason=invalid_stored_final_qr_amount amount=%r", order_id, stored_final_qr_amount)
         return "failed"
     expected_purpose = order.get("payment_purpose")
     payment_qr_upi_purpose = "<none>"
@@ -921,35 +915,34 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                     is_received_body = bool(
                         re.search(r"you\s+have\s+successfully\s+received", body, re.IGNORECASE)
                     )
-                    amount_match = parsed.get("amount") == expected_amount
+                    amount_match = False
                     purpose_match = (
                         expected_purpose is not None
                         and parsed.get("purpose") == expected_purpose
                     )
-                    decimal_amount_match = False
-                    decimal_amount_reason = None
                     exact_comparison_result = False
+                    amount_match_reason = None
                     email_amount_raw = parsed.get("amount_raw")
                     email_amount_precision = parsed.get("amount_precision")
                     if parsed.get("amount_ambiguous"):
-                        decimal_amount_reason = "ambiguous_email_amount"
+                        amount_match_reason = "ambiguous_email_amount"
                     elif email_amount_raw is None:
-                        decimal_amount_reason = "missing_email_amount"
+                        amount_match_reason = "missing_email_amount"
                     else:
                         try:
                             exact_comparison_result = (
                                 Decimal(str(email_amount_raw)) == expected_amount
                             )
                             if email_amount_precision != 2:
-                                decimal_amount_reason = "email_amount_precision_not_two"
+                                amount_match_reason = "email_amount_precision_not_two"
                             elif exact_comparison_result:
-                                decimal_amount_match = True
+                                amount_match = True
                             else:
-                                decimal_amount_reason = "email_amount_does_not_match_final_qr_amount"
+                                amount_match_reason = "email_amount_does_not_match_final_qr_amount"
                         except (InvalidOperation, TypeError, ValueError):
-                            decimal_amount_reason = "invalid_email_amount"
-                    if decimal_amount_match:
-                        decimal_amount_reason = "exact_final_qr_amount_match"
+                            amount_match_reason = "invalid_email_amount"
+                    if exact_comparison_result and email_amount_precision == 2:
+                        amount_match_reason = "exact_final_qr_amount_match"
                     email_timestamp = parsed.get("timestamp")
                     timestamp_match = bool(
                         email_timestamp
@@ -980,7 +973,6 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         and sender_match
                         and timestamp_match
                         and bool(transaction_id)
-                        and (purpose_match or decimal_amount_match)
                         and amount_match
                     )
                     logger.info(
@@ -990,11 +982,11 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         "selected_mailbox=%s candidate_email_count=%d "
                         "stored_original_plan_amount=%s stored_base_amount=%s "
                         "stored_decimal_adjustment=%s "
-                        "stored_final_qr_amount=%s extracted_email_amount=%s "
+                        "stored_final_qr_amount=%s received_amount=%s "
                         "email_amount_precision=%s exact_comparison_result=%s "
-                        "decimal_amount_reason=%s masked_sender=%s subject=%r extracted_amount=%s "
-                        "extracted_purpose=%s amount_match=%s "
-                        "purpose_match=%s decimal_amount_match=%s transaction_id_present=%s "
+                        "amount_match_reason=%s masked_sender=%s subject=%r "
+                        "extracted_purpose=%s amount_match=%s purpose_match=%s "
+                        "transaction_id_present=%s "
                         "sender_match=%s timestamp_match=%s final_match=%s expiry_status=%s",
                         order_id,
                         expected_amount,
@@ -1009,14 +1001,12 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         email_amount_raw if email_amount_raw is not None else "<none>",
                         email_amount_precision if email_amount_precision is not None else "<none>",
                         exact_comparison_result,
-                        decimal_amount_reason,
+                        amount_match_reason,
                         _mask_sender(parsed.get("sender")),
                         subject,
-                        parsed.get("amount") if parsed.get("amount") is not None else "<none>",
                         parsed.get("purpose") or "<none>",
                         amount_match,
                         purpose_match,
-                        decimal_amount_match,
                         bool(transaction_id),
                         sender_match,
                         timestamp_match,
@@ -1029,13 +1019,11 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         continue
                     if not is_received_body:
                         continue
-                    if not purpose_match and not decimal_amount_match:
-                        continue
                     if not amount_match or not sender_match or not timestamp_match or not transaction_id:
                         continue
                     imap_client.close()
                     imap_client.logout()
-                    verification_method = "purpose" if purpose_match else "decimal_amount"
+                    verification_method = "amount"
                     claimed = await claim_famapp_payment(
                         order_id,
                         int(order["user_id"]),

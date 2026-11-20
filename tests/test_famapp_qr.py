@@ -125,14 +125,14 @@ class FamAppQrTests(unittest.TestCase):
             result = asyncio.run(payment._verify_payment_famapp(order_id, amount))
 
         self.assertEqual(result, "success")
-        claim.assert_awaited_once_with(order_id, 7, "TXN123456789", "purpose")
+        claim.assert_awaited_once_with(order_id, 7, "TXN123456789", "amount")
         get_order.assert_awaited_once_with(order_id)
         messages = "\n".join(logs.output)
         self.assertIn("candidate_email_count=1", messages)
         self.assertIn(f"payment_qr_upi_purpose={purpose}", messages)
         self.assertIn("masked_sender=n***@famapp.in", messages)
         self.assertNotIn("no-reply@famapp.in", messages)
-        self.assertIn("extracted_amount=1.00", messages)
+        self.assertIn("received_amount=1.00", messages)
         self.assertIn(f"extracted_purpose={purpose}", messages)
         self.assertIn("amount_match=True", messages)
         self.assertIn("purpose_match=True", messages)
@@ -250,8 +250,27 @@ class FamAppQrTests(unittest.TestCase):
             "ORD-DECIMAL-VERIFY",
             7,
             "TXN123456789",
-            "decimal_amount",
+            "amount",
         )
+
+    def test_exact_final_qr_amount_matches_without_purpose_or_decimal_fallback(self):
+        with self.assertLogs(payment.logger, level="INFO") as logs:
+            result, claim = self._verify_email("149.26", "149.26")
+
+        self.assertEqual(result, "success")
+        claim.assert_awaited_once_with(
+            "ORD-DECIMAL-VERIFY",
+            7,
+            "TXN123456789",
+            "amount",
+        )
+        messages = "\n".join(logs.output)
+        self.assertIn("expected_amount=149.26", messages)
+        self.assertIn("received_amount=149.26", messages)
+        self.assertIn("amount_match=True", messages)
+        self.assertIn("purpose_match=False", messages)
+        self.assertIn("final_match=True", messages)
+        self.assertNotIn("decimal_amount_match=", messages)
 
     def test_exact_107_email_matches_stored_final_qr_amount(self):
         with self.assertLogs(payment.logger, level="INFO") as logs:
@@ -262,15 +281,16 @@ class FamAppQrTests(unittest.TestCase):
             "ORD-DECIMAL-VERIFY",
             7,
             "TXN123456789",
-            "decimal_amount",
+            "amount",
         )
         messages = "\n".join(logs.output)
         self.assertIn("stored_original_plan_amount=149", messages)
         self.assertIn("stored_decimal_adjustment=<none>", messages)
         self.assertIn("stored_final_qr_amount=1.07", messages)
-        self.assertIn("extracted_email_amount=1.07", messages)
+        self.assertIn("received_amount=1.07", messages)
         self.assertIn("exact_comparison_result=True", messages)
-        self.assertIn("decimal_amount_match=True", messages)
+        self.assertIn("amount_match=True", messages)
+        self.assertNotIn("decimal_amount_match=", messages)
 
     def test_decimal_fallback_does_not_require_a_usable_payment_purpose(self):
         result, claim = self._verify_email("149.23", "149.23", purpose="not-a-valid-purpose")
@@ -279,7 +299,7 @@ class FamAppQrTests(unittest.TestCase):
             "ORD-DECIMAL-VERIFY",
             7,
             "TXN123456789",
-            "decimal_amount",
+            "amount",
         )
 
     def test_wrong_or_rounded_decimal_email_does_not_verify(self):
@@ -310,7 +330,7 @@ class FamAppQrTests(unittest.TestCase):
                     "ORD-OTHER",
                     7,
                     "TXN123456789",
-                    "decimal_amount",
+                    "amount",
                 )
 
         self.assertFalse(asyncio.run(claim_duplicate()))
