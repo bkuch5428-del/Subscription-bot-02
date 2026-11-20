@@ -21,9 +21,11 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 from config import VC_GATEWAY_ENABLED
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,10 @@ _settings = _db["settings"]
 _counters = _db["counters"]
 _reminders = _db["reminders"]
 _demo_sessions = _db["demo_sessions"]
+
+
+class FamAppAmountReservationError(Exception):
+    """Raised when another active FamApp order already reserves the amount."""
 
 
 def _as_utc_datetime(value: datetime | str | None) -> datetime | None:
@@ -132,6 +138,8 @@ async def init_db() -> None:
     await _orders.create_index("subscription_end")
     await _orders.create_index("payment_provider")
     await _orders.create_index("vc_order_id", sparse=True, unique=True)
+    await _orders.create_index("famapp_reserved_amount", sparse=True, unique=True)
+    await _orders.create_index("famapp_transaction_id", sparse=True, unique=True)
     await _reminders.create_index("first_due")
     await _reminders.create_index("second_due")
     await _demo_sessions.create_index([("status", 1), ("expires_at", 1)])
@@ -1003,6 +1011,9 @@ async def create_order(
     expires_at: datetime | None = None,
     payment_provider: str = "famapp",
     vc_order_id: str | None = None,
+    famapp_base_amount: str | None = None,
+    famapp_adjustment: str | None = None,
+    famapp_qr_amount: str | None = None,
 ) -> None:
     """Insert a new order row with status 'created'.
 
@@ -1039,7 +1050,59 @@ async def create_order(
         }
         if vc_order_id:
             order_doc["vc_order_id"] = vc_order_id
+        if payment_provider == "famapp" and famapp_qr_amount is not None:
+            order_doc.update({
+                "famapp_base_amount": famapp_base_amount,
+                "famapp_adjustment": famapp_adjustment,
+                "famapp_qr_amount": famapp_qr_amount,
+                "famapp_reserved_amount": famapp_qr_amount,
+            })
+            now = datetime.now(timezone.utc)
+            await _orders.update_many(
+                {
+                    "famapp_reserved_amount": famapp_qr_amount,
+                    "payment_status": {"$in": ["created", "pending"]},
+                    "expires_at": {"$lte": now},
+                },
+                {
+                    "$set": {"payment_status": "expired", "expiry_notified": False},
+                    "$unset": {"famapp_reserved_amount": ""},
+                },
+            )
+            legacy_cursor = _orders.find(
+                {
+                    "payment_status": {"$in": ["created", "pending"]},
+                    "famapp_reserved_amount": {"$exists": False},
+                    "$or": [
+                        {"payment_provider": "famapp"},
+                        {
+                            "payment_provider": {"$exists": False},
+                            "payment_purpose": {"$exists": True},
+                        },
+                    ],
+                },
+                {"final_price": 1, "expires_at": 1},
+            )
+            async for existing in legacy_cursor:
+                existing_expiry = _as_utc_datetime(existing.get("expires_at"))
+                if existing_expiry and existing_expiry <= now:
+                    continue
+                try:
+                    if Decimal(str(existing.get("final_price") or existing.get("plan_price"))) == Decimal(famapp_qr_amount):
+                        raise FamAppAmountReservationError(
+                            f"FamApp amount {famapp_qr_amount} is used by a legacy active order"
+                        )
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
         await _orders.insert_one(order_doc)
+    except DuplicateKeyError as exc:
+        if "famapp_reserved_amount" in str(exc):
+            raise FamAppAmountReservationError(
+                f"FamApp amount {famapp_qr_amount} is already reserved"
+            ) from exc
+        if "duplicate key" in str(exc).lower() or "E11000" in str(exc):
+            raise Exception(f"UNIQUE constraint failed: orders.order_id ({exc})")
+        raise
     except Exception as exc:
         # Preserve the SQLite-era "UNIQUE" signal so callers retrying on
         # order_id collisions (see handlers/payment.py) keep working.
@@ -1058,11 +1121,14 @@ async def supersede_active_orders(user_id: int, plan_id: int | None, new_order_i
             "_id": {"$ne": new_order_id},
             "payment_status": {"$in": ["created", "pending"]},
         },
-        {"$set": {
-            "payment_status": "superseded",
-            "superseded_by": new_order_id,
-            "cancelled_at": datetime.now(timezone.utc),
-        }},
+        {
+            "$set": {
+                "payment_status": "superseded",
+                "superseded_by": new_order_id,
+                "cancelled_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"famapp_reserved_amount": ""},
+        },
     )
     if result.modified_count:
         logger.info(
@@ -1092,7 +1158,10 @@ async def update_order_status(order_id: str, status: str) -> bool:
         if expires_at and datetime.now(timezone.utc) >= expires_at:
             await _orders.update_one(
                 {"_id": order_id, "payment_status": {"$in": ["created", "pending"]}},
-                {"$set": {"payment_status": "expired", "expiry_notified": False}},
+                {
+                    "$set": {"payment_status": "expired", "expiry_notified": False},
+                    "$unset": {"famapp_reserved_amount": ""},
+                },
             )
             logger.warning(
                 "Order %s rejected pending transition: expired_at=%s status=%s",
@@ -1105,7 +1174,10 @@ async def update_order_status(order_id: str, status: str) -> bool:
         return False
     result = await _orders.update_one(
         {"_id": order_id, "payment_status": old_status},
-        {"$set": {"payment_status": status}},
+        {
+            "$set": {"payment_status": status},
+            **({"$unset": {"famapp_reserved_amount": ""}} if status != "pending" else {}),
+        },
     )
     if result.modified_count:
         logger.debug("Order %s → %s", order_id, status)
@@ -1173,7 +1245,10 @@ async def expire_due_orders(now: datetime | None = None) -> list[dict]:
                     {"payment_status": "created"},
                 ],
             },
-            {"$set": {"payment_status": "expired", "expiry_notified": False}},
+            {
+                "$set": {"payment_status": "expired", "expiry_notified": False},
+                "$unset": {"famapp_reserved_amount": ""},
+            },
         )
         if result.modified_count:
             expired.append(doc)
@@ -1223,6 +1298,56 @@ async def save_provider_response_summary(order_id: str, user_id: int, summary: d
     )
 
 
+async def claim_famapp_payment(
+    order_id: str,
+    user_id: int,
+    transaction_id: str,
+    verification_method: str,
+) -> bool:
+    """Atomically claim a unique FamApp transaction for one live order."""
+    now = datetime.now(timezone.utc)
+    query = {
+        "_id": order_id,
+        "user_id": user_id,
+        "payment_provider": "famapp",
+        "payment_status": {"$in": ["created", "pending"]},
+        "$and": [
+            {
+                "$or": [
+                    {"famapp_transaction_id": {"$exists": False}},
+                    {"famapp_transaction_id": transaction_id},
+                ]
+            },
+            {
+                "$or": [
+                    {"expires_at": {"$gt": now}},
+                    {"expires_at": {"$exists": False}},
+                    {"expires_at": None},
+                ]
+            },
+        ],
+    }
+    try:
+        claimed = await _orders.find_one_and_update(
+            query,
+            {
+                "$set": {
+                    "payment_status": "pending",
+                    "famapp_transaction_id": transaction_id,
+                    "famapp_verification_method": verification_method,
+                    "famapp_verified_at": now,
+                },
+            },
+        )
+    except DuplicateKeyError:
+        logger.warning(
+            "FamApp transaction rejected order_id=%s reason=duplicate_transaction",
+            order_id,
+        )
+        return False
+    return claimed is not None
+
+
 async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> dict | None:
     """Return a non-expired in-progress order for this exact user and plan."""
     return await _orders.find_one(
@@ -1256,6 +1381,9 @@ async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> d
             "payment_message_id": 1,
             "status_message_id": 1,
             "referral_discount_used": 1,
+            "famapp_base_amount": 1,
+            "famapp_adjustment": 1,
+            "famapp_qr_amount": 1,
         },
     )
 
@@ -1267,6 +1395,7 @@ async def approve_order(
     expected_vc_order_id: str | None = None,
     expected_amount: str | None = None,
     allow_created: bool = False,
+    require_famapp_transaction: bool = False,
 ) -> dict | None:
     """
     Approve an order:
@@ -1299,6 +1428,9 @@ async def approve_order(
         query["vc_order_id"] = expected_vc_order_id
     if expected_amount is not None:
         query["expected_amount"] = expected_amount
+    if require_famapp_transaction:
+        query["payment_provider"] = "famapp"
+        query["famapp_transaction_id"] = {"$exists": True}
     peek = await _orders.find_one(query)
     if not peek:
         return None
@@ -1318,7 +1450,7 @@ async def approve_order(
             "payment_status":     "approved",
             "subscription_start": now.isoformat(),
             "subscription_end":   sub_end.isoformat(),
-        }},
+        }, "$unset": {"famapp_reserved_amount": ""}},
     )
     if not doc:
         # Another concurrent call already approved/changed this order.
@@ -1392,6 +1524,13 @@ async def get_order(order_id: str) -> dict | None:
         "expires_at":       doc.get("expires_at"),
         "status_message_id": doc.get("status_message_id"),
         "superseded_by": doc.get("superseded_by"),
+        "created_at": doc.get("created_at"),
+        "famapp_base_amount": doc.get("famapp_base_amount"),
+        "famapp_adjustment": doc.get("famapp_adjustment"),
+        "famapp_qr_amount": doc.get("famapp_qr_amount"),
+        "famapp_transaction_id": doc.get("famapp_transaction_id"),
+        "famapp_verification_method": doc.get("famapp_verification_method"),
+        "referral_discount_used": doc.get("referral_discount_used", 0),
     }
 
 

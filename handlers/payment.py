@@ -55,6 +55,8 @@ from config import (
 )
 from database import (
     create_order,
+    FamAppAmountReservationError,
+    claim_famapp_payment,
     update_order_status,
     approve_order,
     get_order,
@@ -397,10 +399,14 @@ def _generate_famapp_purpose() -> str:
 
 
 def _build_famapp_upi_uri(amount: str | Decimal, purpose: str) -> str:
+    raw_amount = Decimal(str(amount))
+    exact_amount = raw_amount.quantize(Decimal("0.01"))
+    if raw_amount != exact_amount:
+        raise ValueError("FamApp QR amounts must be exact to paise")
     params = {
         "pa": DEFAULT_UPI_ID,
         "pn": DEFAULT_PAYEE_NAME,
-        "am": _format_amount(amount),
+        "am": f"{exact_amount:.2f}",
         "cu": "INR",
         "tn": purpose,
     }
@@ -437,14 +443,33 @@ def _now_ist() -> str:
 
 
 def _parse_amount_from_text(text: str) -> Decimal | None:
-    match = re.search(r"₹\s*([0-9][0-9,]*(?:\.\d+)?)", text, re.IGNORECASE)
-    if not match:
+    details = _parse_amount_details(text)
+    if details is None:
         return None
-    normalized = match.group(1).replace(",", "")
+    normalized = details["value"].replace(",", "")
     try:
         return Decimal(normalized).quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _parse_amount_details(text: str) -> dict | None:
+    matches = re.findall(r"₹\s*([0-9][0-9,]*(?:\.\d+)?)", text, re.IGNORECASE)
+    if not matches:
+        return None
+    normalized = [value.replace(",", "") for value in matches]
+    try:
+        values = [Decimal(value) for value in normalized]
+    except InvalidOperation:
+        return None
+    if any(value != values[0] for value in values[1:]):
+        return {"value": normalized[0], "precision": None, "ambiguous": True}
+    precision = len(normalized[0].partition(".")[2]) if "." in normalized[0] else 0
+    return {
+        "value": normalized[0],
+        "precision": precision,
+        "ambiguous": False,
+    }
 
 
 def _decode_imap_part(value: bytes | None) -> str:
@@ -588,9 +613,15 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
         rf"({re.escape(prefix)}[0-9]{{8}}[A-Z0-9]{{6}})\b"
     )
     purpose = purpose_pattern.search(combined_text)
+    amount_details = _parse_amount_details(combined_text)
     amount = _parse_amount_from_text(combined_text)
+    transaction = re.search(
+        r"(?i)\b(?:transaction\s*(?:id|no\.?|number|ref(?:erence)?)|"
+        r"utr(?:\s*(?:no\.?|number))?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9/-]{5,})",
+        combined_text,
+    )
     date_value = message.get("Date")
-    timestamp = datetime.now(timezone.utc)
+    timestamp = None
     if date_value:
         try:
             parsed = parsedate_to_datetime(date_value)
@@ -598,7 +629,7 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             timestamp = parsed.astimezone(timezone.utc)
         except Exception:
-            pass
+            timestamp = None
     return {
         "message_id": message_id,
         "sender": sender,
@@ -606,8 +637,26 @@ def _parse_famapp_email(raw_message: bytes, message_id: str) -> dict | None:
         "body": body,
         "timestamp": timestamp,
         "purpose": purpose.group(1) if purpose else None,
+        "purpose_present": bool(re.search(r"(?i)\bPurpose\s*:", combined_text)),
         "amount": amount,
+        "amount_raw": amount_details["value"] if amount_details else None,
+        "amount_precision": amount_details["precision"] if amount_details else None,
+        "amount_ambiguous": amount_details["ambiguous"] if amount_details else True,
+        "transaction_id": transaction.group(1).upper() if transaction else None,
     }
+
+
+def _famapp_datetime_utc(value) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: int | None = None) -> str:
@@ -655,15 +704,20 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
             order.get("user_id"),
         )
         return "failed"
-    if order.get("payment_status") in {"expired", "approved", "cancelled", "failed", "rejected"}:
+    if _order_provider(order) != "famapp":
+        logger.warning("FamApp verification rejected order_id=%s reason=wrong_provider", order_id)
+        return "failed"
+    if order.get("payment_status") not in {"created", "pending"}:
         logger.warning(
-            "FamApp verification rejected order_id=%s reason=terminal_status status=%s",
+            "FamApp verification rejected order_id=%s reason=ineligible_status status=%s",
             order_id,
             order.get("payment_status"),
         )
         return "expired" if order.get("payment_status") == "expired" else "failed"
 
-    expected_amount = Decimal(str(order.get("final_price") or order.get("plan_price") or "0")).quantize(Decimal("0.01"))
+    expected_amount = Decimal(
+        str(order.get("famapp_qr_amount") or order.get("final_price") or order.get("plan_price") or "0")
+    ).quantize(Decimal("0.01"))
     try:
         supplied_amount = Decimal(str(amount or "0")).quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError):
@@ -690,19 +744,14 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
             )
         except (TypeError, ValueError):
             payment_qr_upi_purpose = "<invalid>"
-    expiry = None
-    expiry_status = "missing"
-    if order.get("expires_at"):
-        try:
-            expiry = datetime.fromisoformat(str(order["expires_at"]))
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            expiry = expiry.astimezone(timezone.utc)
-            expiry_status = "expired" if datetime.now(timezone.utc) >= expiry else "active"
-        except Exception:
-            expiry = None
-            expiry_status = "invalid"
-    if expiry and datetime.now(timezone.utc) >= expiry:
+    created_at = _famapp_datetime_utc(order.get("created_at"))
+    expiry = _famapp_datetime_utc(order.get("expires_at"))
+    now = datetime.now(timezone.utc)
+    expiry_status = "active" if expiry and now < expiry else "expired" if expiry else "invalid"
+    if not created_at or not expiry:
+        logger.warning("FamApp verification rejected order_id=%s reason=invalid_payment_window", order_id)
+        return "failed"
+    if now >= expiry:
         logger.info(
             "FamApp verification order_id=%s expected_amount=%s "
             "expected_payment_purpose=%s imap_connection=not_attempted "
@@ -870,11 +919,54 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         expected_purpose is not None
                         and parsed.get("purpose") == expected_purpose
                     )
+                    decimal_amount_match = False
+                    if (
+                        parsed.get("purpose") is None
+                        and not parsed.get("purpose_present")
+                        and not parsed.get("amount_ambiguous")
+                    ):
+                        try:
+                            decimal_amount_match = (
+                                parsed.get("amount_precision") == 2
+                                and Decimal(str(parsed.get("amount_raw"))) == expected_amount
+                            )
+                        except (InvalidOperation, TypeError, ValueError):
+                            decimal_amount_match = False
+                    email_timestamp = parsed.get("timestamp")
+                    timestamp_match = bool(
+                        email_timestamp
+                        and created_at <= email_timestamp <= expiry
+                        and email_timestamp <= now
+                    )
+                    sender_address = parseaddr(parsed.get("sender") or "")[1].lower()
+                    configured_sender = (IMAP_SENDER_FILTER or "").strip().lower()
+                    sender_match = bool(
+                        sender_address
+                        and (
+                            sender_address == configured_sender
+                            or (
+                                "@" in configured_sender
+                                and sender_address.rsplit("@", 1)[-1]
+                                == configured_sender.rsplit("@", 1)[-1]
+                            )
+                            or (configured_sender and configured_sender in sender_address)
+                            or "famapp" in sender_address
+                            or "famx" in sender_address
+                        )
+                    )
+                    transaction_id = parsed.get("transaction_id")
                     final_match = (
                         not is_outgoing_payment
                         and is_received_subject
                         and is_received_body
-                        and purpose_match
+                        and sender_match
+                        and timestamp_match
+                        and bool(transaction_id)
+                        and (
+                            purpose_match
+                            if parsed.get("purpose_present")
+                            else decimal_amount_match
+                        )
                         and amount_match
                     )
                     logger.info(
@@ -884,7 +976,8 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         "selected_mailbox=%s candidate_email_count=%d "
                         "masked_sender=%s subject=%r extracted_amount=%s "
                         "extracted_purpose=%s amount_match=%s "
-                        "purpose_match=%s final_match=%s expiry_status=%s",
+                        "purpose_match=%s decimal_amount_match=%s transaction_id_present=%s "
+                        "sender_match=%s timestamp_match=%s final_match=%s expiry_status=%s",
                         order_id,
                         expected_amount,
                         expected_purpose,
@@ -897,6 +990,10 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         parsed.get("purpose") or "<none>",
                         amount_match,
                         purpose_match,
+                        decimal_amount_match,
+                        bool(transaction_id),
+                        sender_match,
+                        timestamp_match,
                         final_match,
                         expiry_status,
                     )
@@ -906,13 +1003,35 @@ async def _verify_payment_famapp(order_id: str, amount: str, expected_user_id: i
                         continue
                     if not is_received_body:
                         continue
-                    if not purpose_match:
+                    if parsed.get("purpose_present") and not purpose_match:
                         continue
-                    if not amount_match:
+                    if not parsed.get("purpose_present") and not decimal_amount_match:
+                        continue
+                    if not amount_match or not sender_match or not timestamp_match or not transaction_id:
                         continue
                     imap_client.close()
                     imap_client.logout()
-                    return "success"
+                    verification_method = "purpose" if purpose_match else "decimal_amount"
+                    claimed = await claim_famapp_payment(
+                        order_id,
+                        int(order["user_id"]),
+                        transaction_id,
+                        verification_method,
+                    )
+                    if claimed:
+                        return "success"
+                    latest_order = await get_order(order_id)
+                    if (
+                        latest_order
+                        and latest_order.get("payment_status") == "approved"
+                        and latest_order.get("famapp_transaction_id") == transaction_id
+                    ):
+                        return "success"
+                    logger.warning(
+                        "FamApp verification rejected order_id=%s reason=transaction_claim_failed",
+                        order_id,
+                    )
+                    return "pending"
         imap_client.close()
         imap_client.logout()
         logger.warning(
@@ -958,6 +1077,7 @@ async def _send_payment_screen(
     final_price_str: str,
     price_section: str,
     discount_pct: int,
+    base_price_str: str | None = None,
 ) -> str | None:
     """
     Create a new order, send the QR photo and payment details message.
@@ -965,14 +1085,18 @@ async def _send_payment_screen(
     can delete both messages when issuing a replacement.
     Returns the new order_id, or None if order creation failed.
     """
-    # Retry up to 5 times on PK collision
+    famapp_base_amount = Decimal(str(base_price_str or final_price_str)).quantize(Decimal("0.01"))
     order_id: str | None = None
     famapp_purpose = _generate_famapp_purpose()
-    famapp_upi_uri = _build_famapp_upi_uri(final_price_str, famapp_purpose)
-    famapp_qr_bytes = _generate_famapp_qr_bytes(final_price_str, famapp_purpose)
     famapp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=int(ORDER_EXPIRY_MINUTES or 15))
 
-    for _ in range(5):
+    for adjustment_cents in secrets.SystemRandom().sample(range(1, 50), 49):
+        famapp_adjustment = (Decimal(adjustment_cents) / Decimal(100)).quantize(Decimal("0.01"))
+        famapp_qr_amount = (famapp_base_amount + famapp_adjustment).quantize(Decimal("0.01"))
+        qr_amount_str = f"{famapp_qr_amount:.2f}"
+        adjustment_str = f"{famapp_adjustment:.2f}"
+        famapp_upi_uri = _build_famapp_upi_uri(qr_amount_str, famapp_purpose)
+        famapp_qr_bytes = _generate_famapp_qr_bytes(qr_amount_str, famapp_purpose)
         candidate = _make_order_id()
         try:
             await create_order(
@@ -983,7 +1107,7 @@ async def _send_payment_screen(
                 order_id=candidate,
                 plan_id=plan_id,
                 access_link=plan["access_link"],
-                final_price=final_price_str,
+                final_price=qr_amount_str,
                 referral_discount_used=discount_pct,
                 payment_purpose=famapp_purpose,
                 upi_uri=famapp_upi_uri,
@@ -991,10 +1115,21 @@ async def _send_payment_screen(
                 qr_image=famapp_qr_bytes,
                 expires_at=famapp_expires_at,
                 payment_provider="famapp",
+                famapp_base_amount=f"{famapp_base_amount:.2f}",
+                famapp_adjustment=adjustment_str,
+                famapp_qr_amount=qr_amount_str,
             )
             order_id = candidate
+            final_price_str = qr_amount_str
             logger.info("ORDER CREATED order_id=%s user_id=%s plan_id=%s expires_at=%s", order_id, user_id, plan_id, famapp_expires_at.isoformat())
             break
+        except FamAppAmountReservationError:
+            logger.info(
+                "FamApp amount reservation collision user_id=%s amount=%s; generating another adjustment",
+                user_id,
+                qr_amount_str,
+            )
+            continue
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
                 logger.warning("Order ID collision on %s — retrying", candidate)
@@ -1010,11 +1145,12 @@ async def _send_payment_screen(
     # Build payment message text
     _default_tpl = (
         "💳 <b>Payment Details</b>\n\n"
-        "📦 <b>Plan:</b> {plan_name}\n"
+        "📦 <b>Plan:</b> {plan_name} — ₹{plan_price}\n"
         "{price_section}\n"
         "⌛ <b>Validity:</b> {plan_validity}\n\n"
         "📲 Scan the QR code above using any UPI app.\n\n"
         "✅ <b>Pay ₹{final_price_str}</b> by scanning the <b>QR Code</b> above.\n"
+        "ℹ️ The QR contains a small automatic verification adjustment. Pay the amount pre-filled by the QR without editing it.\n"
         "✅ After paying, tap <b>Check Payment Status</b> — your plan unlocks instantly once the payment is confirmed.\n\n"
         "🆔 <b>Order:</b> #{order_id}"
     )
@@ -1032,6 +1168,11 @@ async def _send_payment_screen(
     except (KeyError, ValueError, IndexError):
         logger.warning("payment_message template is malformed — using default")
         payment_msg_text = _default_tpl.format(**_fmt_kwargs)
+    if "automatic verification adjustment" not in payment_msg_text.lower():
+        payment_msg_text += (
+            "\n\nℹ️ The QR contains a small automatic verification adjustment. "
+            "Pay the amount pre-filled by the QR without editing it."
+        )
 
     # Send FamApp QR image and capture its message ID.
     qr_data = BytesIO(famapp_qr_bytes)
@@ -1076,6 +1217,8 @@ async def _send_payment_screen(
         "plan_name": plan["name"],
         "plan_price": plan["price"],
         "final_price": final_price_str,
+        "famapp_base_amount": f"{famapp_base_amount:.2f}",
+        "famapp_adjustment": adjustment_str,
         "plan_validity": plan["validity"],
         "access_link": plan["access_link"],
         "price_section": price_section,
@@ -1152,6 +1295,10 @@ async def _restore_existing_payment_screen(
                 "plan_name": plan["name"],
                 "plan_price": plan["price"],
                 "final_price": final_price_str,
+                "famapp_base_amount": order.get("famapp_base_amount")
+                or order.get("final_price")
+                or order.get("plan_price"),
+                "famapp_adjustment": order.get("famapp_adjustment"),
                 "plan_validity": plan["validity"],
                 "access_link": plan["access_link"],
                 "price_section": price_section,
@@ -1186,11 +1333,12 @@ async def _restore_existing_payment_screen(
     payment_tpl = await get_setting("payment_message")
     default_tpl = (
         "💳 <b>Payment Details</b>\n\n"
-        "📦 <b>Plan:</b> {plan_name}\n"
+        "📦 <b>Plan:</b> {plan_name} — ₹{plan_price}\n"
         "{price_section}\n"
         "⌛ <b>Validity:</b> {plan_validity}\n\n"
         "📲 Scan the QR code above using any UPI app.\n\n"
         "✅ <b>Pay ₹{final_price_str}</b> by scanning the <b>QR Code</b> above.\n"
+        "ℹ️ The QR contains a small automatic verification adjustment. Pay the amount pre-filled by the QR without editing it.\n"
         "✅ After paying, tap <b>Check Payment Status</b> — your plan unlocks instantly once the payment is confirmed.\n\n"
         "🆔 <b>Order:</b> #{order_id}"
     )
@@ -1207,6 +1355,11 @@ async def _restore_existing_payment_screen(
         payment_text = template.format(**format_args)
     except (KeyError, ValueError, IndexError):
         payment_text = default_tpl.format(**format_args)
+    if "automatic verification adjustment" not in payment_text.lower():
+        payment_text += (
+            "\n\nℹ️ The QR contains a small automatic verification adjustment. "
+            "Pay the amount pre-filled by the QR without editing it."
+        )
 
     qr_message_id = None
     if qr_bytes:
@@ -1982,6 +2135,12 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         # Cold start recovery — fetch what we need from the DB
         order_doc = await get_order(order_id)
         if order_doc:
+            base_amount = (
+                order_doc.get("famapp_base_amount")
+                or order_doc.get("final_price")
+                or order_doc.get("plan_price", "0")
+            )
+            discount_pct = order_doc.get("referral_discount_used", 0) or 0
             info = {
                 "order_id": order_id,
                 "plan_id": order_doc.get("plan_id"),
@@ -1989,6 +2148,14 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
                 "plan_price": order_doc.get("plan_price", ""),
                 "final_price": order_doc.get("final_price")
                 or order_doc.get("plan_price", "0"),
+                "famapp_base_amount": base_amount,
+                "famapp_adjustment": order_doc.get("famapp_adjustment"),
+                "price_section": (
+                    f"💰 <b>Original Price:</b> ₹{order_doc.get('plan_price', '')}\n"
+                    f"🎁 <b>Referral Discount:</b> {discount_pct}%\n"
+                    f"💳 <b>Final Price:</b> ₹{base_amount}"
+                ),
+                "discount_pct": discount_pct,
                 "plan_validity": order_doc.get("plan_validity", ""),
                 "access_link": order_doc.get("access_link", ""),
                 "status_message_id": order_doc.get("status_message_id"),
@@ -2003,6 +2170,17 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
     provider_order = await get_order(order_id)
     if not provider_order or provider_order.get("user_id") != user.id or _order_provider(provider_order) != "famapp":
         await call.answer("⚠️ This payment request is not available.", show_alert=True)
+        return
+    if provider_order.get("payment_status") == "approved":
+        await _edit_or_create_status_message(
+            call,
+            bot,
+            user.id,
+            order_id,
+            info,
+            "✅ <b>Your plan is already activated.</b>\n\nUse /status to check your subscription.",
+            main_menu_keyboard(),
+        )
         return
 
     lock_key = (user.id, order_id)
@@ -2039,17 +2217,12 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
         )
 
         if status == "success":
-            order = await get_order(order_id)
-            marked_pending = bool(order and order.get("user_id") == user.id)
-            if marked_pending:
-                marked_pending = await update_order_status(order_id, "pending")
-            logger.info(
-                "Automatic payment state transition order_id=%s user_id=%s marked_pending=%s",
+            result = await approve_order(
                 order_id,
-                user.id,
-                marked_pending,
+                expected_user_id=user.id,
+                expected_payment_provider="famapp",
+                require_famapp_transaction=True,
             )
-            result = await approve_order(order_id, expected_user_id=user.id) if marked_pending else None
             logger.info(
                 "Automatic payment approval completed order_id=%s user_id=%s approved=%s",
                 order_id,
@@ -2201,6 +2374,7 @@ async def callback_i_have_paid(call: CallbackQuery, bot: Bot) -> None:
                 final_price_str=final_price,
                 price_section=info.get("price_section", ""),
                 discount_pct=info.get("discount_pct", 0),
+                base_price_str=info.get("famapp_base_amount"),
             )
     finally:
         status_lock.release()
