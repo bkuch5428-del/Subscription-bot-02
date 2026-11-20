@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import zxingcpp
 from PIL import Image
+from pymongo.errors import DuplicateKeyError
 
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
@@ -19,6 +20,7 @@ os.environ.setdefault("FAMAPP_UPI_ID", "payments@example")
 os.environ.setdefault("FAMAPP_PAYEE_NAME", "Test Payee")
 
 import handlers.payment as payment  # noqa: E402
+import database  # noqa: E402
 from handlers.payment import (  # noqa: E402
     _build_famapp_upi_uri,
     _generate_famapp_qr_bytes,
@@ -251,29 +253,73 @@ class FamAppQrTests(unittest.TestCase):
             "decimal_amount",
         )
 
+    def test_exact_107_email_matches_stored_final_qr_amount(self):
+        with self.assertLogs(payment.logger, level="INFO") as logs:
+            result, claim = self._verify_email("1.07", "1.07")
+
+        self.assertEqual(result, "success")
+        claim.assert_awaited_once_with(
+            "ORD-DECIMAL-VERIFY",
+            7,
+            "TXN123456789",
+            "decimal_amount",
+        )
+        messages = "\n".join(logs.output)
+        self.assertIn("stored_original_plan_amount=149", messages)
+        self.assertIn("stored_decimal_adjustment=<none>", messages)
+        self.assertIn("stored_final_qr_amount=1.07", messages)
+        self.assertIn("extracted_email_amount=1.07", messages)
+        self.assertIn("exact_comparison_result=True", messages)
+        self.assertIn("decimal_amount_match=True", messages)
+
+    def test_decimal_fallback_does_not_require_a_usable_payment_purpose(self):
+        result, claim = self._verify_email("149.23", "149.23", purpose="not-a-valid-purpose")
+        self.assertEqual(result, "success")
+        claim.assert_awaited_once_with(
+            "ORD-DECIMAL-VERIFY",
+            7,
+            "TXN123456789",
+            "decimal_amount",
+        )
+
     def test_wrong_or_rounded_decimal_email_does_not_verify(self):
-        wrong_result, wrong_claim = self._verify_email("149.23", "149.00")
-        rounded_result, rounded_claim = self._verify_email("149.20", "149.2")
+        with self.assertLogs(payment.logger, level="INFO") as logs:
+            wrong_result, wrong_claim = self._verify_email("149.23", "149.00")
+            rounded_result, rounded_claim = self._verify_email("149.20", "149.2")
         self.assertEqual(wrong_result, "pending")
         self.assertEqual(rounded_result, "pending")
         wrong_claim.assert_not_awaited()
         rounded_claim.assert_not_awaited()
+        messages = "\n".join(logs.output)
+        self.assertIn("email_amount_does_not_match_final_qr_amount", messages)
+        self.assertIn("email_amount_precision_not_two", messages)
 
     def test_duplicate_transaction_claim_is_rejected(self):
         result, claim = self._verify_email("149.23", "149.23", claim=False)
         self.assertEqual(result, "pending")
         claim.assert_awaited_once()
 
-    def test_missing_transaction_malformed_purpose_and_ambiguous_amount_stay_pending(self):
+    def test_duplicate_transaction_id_is_rejected_by_global_unique_constraint(self):
+        async def claim_duplicate():
+            with patch.object(
+                database._orders,
+                "find_one_and_update",
+                new=AsyncMock(side_effect=DuplicateKeyError("duplicate transaction id")),
+            ):
+                return await database.claim_famapp_payment(
+                    "ORD-OTHER",
+                    7,
+                    "TXN123456789",
+                    "decimal_amount",
+                )
+
+        self.assertFalse(asyncio.run(claim_duplicate()))
+
+    def test_missing_transaction_and_ambiguous_amount_stay_pending(self):
         missing_tx, missing_tx_claim = self._verify_email(
             "149.23",
             "149.23",
             transaction_id="",
-        )
-        malformed_purpose, malformed_claim = self._verify_email(
-            "149.23",
-            "149.23",
-            purpose="not-a-valid-purpose",
         )
         ambiguous, ambiguous_claim = self._verify_email(
             "149.23",
@@ -281,10 +327,8 @@ class FamAppQrTests(unittest.TestCase):
             extra_text="Updated balance: ₹500.00\n",
         )
         self.assertEqual(missing_tx, "pending")
-        self.assertEqual(malformed_purpose, "pending")
         self.assertEqual(ambiguous, "pending")
         missing_tx_claim.assert_not_awaited()
-        malformed_claim.assert_not_awaited()
         ambiguous_claim.assert_not_awaited()
 
     def test_expired_orders_and_out_of_window_emails_do_not_claim_transactions(self):
