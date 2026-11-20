@@ -1312,12 +1312,7 @@ async def claim_famapp_payment(
         "payment_provider": "famapp",
         "payment_status": {"$in": ["created", "pending"]},
         "$and": [
-            {
-                "$or": [
-                    {"famapp_transaction_id": {"$exists": False}},
-                    {"famapp_transaction_id": transaction_id},
-                ]
-            },
+            {"famapp_transaction_id": {"$exists": False}},
             {
                 "$or": [
                     {"expires_at": {"$gt": now}},
@@ -1346,6 +1341,49 @@ async def claim_famapp_payment(
         )
         return False
     return claimed is not None
+
+
+async def get_active_famapp_orders_for_amount(amount: Decimal) -> list[dict]:
+    """Return live FamApp orders whose final payable amount matches exactly."""
+    now = datetime.now(timezone.utc)
+    cursor = _orders.find(
+        {
+            "payment_status": {"$in": ["created", "pending"]},
+            "$or": [
+                {"payment_provider": "famapp"},
+                {
+                    "payment_provider": {"$exists": False},
+                    "payment_purpose": {"$exists": True},
+                },
+            ],
+        },
+        {
+            "_id": 1,
+            "payment_purpose": 1,
+            "famapp_qr_amount": 1,
+            "final_price": 1,
+            "plan_price": 1,
+            "created_at": 1,
+            "expires_at": 1,
+        },
+    )
+    matching_orders = []
+    async for order in cursor:
+        created_at = _as_utc_datetime(order.get("created_at"))
+        expires_at = _as_utc_datetime(order.get("expires_at"))
+        if not created_at or not expires_at or expires_at <= now:
+            continue
+        final_amount = (
+            order.get("famapp_qr_amount")
+            or order.get("final_price")
+            or order.get("plan_price")
+        )
+        try:
+            if final_amount is not None and Decimal(str(final_amount)) == amount:
+                matching_orders.append(order)
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return matching_orders
 
 
 async def get_active_order_for_user_plan(user_id: int, plan_id: int | None) -> dict | None:

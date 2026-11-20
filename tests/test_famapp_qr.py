@@ -114,6 +114,11 @@ class FamAppQrTests(unittest.TestCase):
 
         with (
             patch.object(payment, "get_order", new=AsyncMock(return_value=order)) as get_order,
+            patch.object(
+                payment,
+                "get_active_famapp_orders_for_amount",
+                new=AsyncMock(return_value=[{"_id": order_id, "payment_purpose": purpose}]),
+            ),
             patch.object(payment, "imaplib") as imaplib,
             patch.object(payment, "IMAP_USERNAME", "test@example.com"),
             patch.object(payment, "IMAP_APP_PASSWORD", "test-password"),
@@ -210,6 +215,8 @@ class FamAppQrTests(unittest.TestCase):
         timestamp: datetime | None = None,
         transaction_id: str = "TXN123456789",
         extra_text: str = "",
+        active_orders: list[dict] | None = None,
+        raw_email: bytes | None = None,
     ):
         order_id = "ORD-DECIMAL-VERIFY"
         now = datetime.now(timezone.utc)
@@ -227,18 +234,24 @@ class FamAppQrTests(unittest.TestCase):
         claim_mock = AsyncMock(return_value=claim)
         with (
             patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+            patch.object(
+                payment,
+                "get_active_famapp_orders_for_amount",
+                new=AsyncMock(
+                    return_value=active_orders
+                    if active_orders is not None
+                    else [{"_id": order_id, "payment_purpose": order["payment_purpose"]}]
+                ),
+            ),
             patch.object(payment, "imaplib") as imaplib,
             patch.object(payment, "IMAP_USERNAME", "test@example.com"),
             patch.object(payment, "IMAP_APP_PASSWORD", "test-password"),
             patch.object(payment, "claim_famapp_payment", new=claim_mock),
         ):
             imaplib.IMAP4_SSL.side_effect = FakeFamAppImap
-            FakeFamAppImap.raw_email = _received_email(
-                email_amount,
-                purpose,
-                transaction_id=transaction_id,
-                timestamp=timestamp,
-                extra_text=extra_text,
+            FakeFamAppImap.raw_email = raw_email or _received_email(
+                email_amount, purpose, transaction_id=transaction_id,
+                timestamp=timestamp, extra_text=extra_text,
             )
             result = asyncio.run(payment._verify_payment_famapp(order_id, amount, expected_user_id=7))
         return result, claim_mock
@@ -272,7 +285,26 @@ class FamAppQrTests(unittest.TestCase):
         self.assertIn("final_match=True", messages)
         self.assertNotIn("decimal_amount_match=", messages)
 
-    def test_exact_107_email_matches_stored_final_qr_amount(self):
+    def test_exact_114_email_matches_stored_final_qr_amount_without_precision_metadata(self):
+        with self.assertLogs(payment.logger, level="INFO") as logs:
+            result, claim = self._verify_email("1.14", "1.14")
+
+        self.assertEqual(result, "success")
+        claim.assert_awaited_once_with(
+            "ORD-DECIMAL-VERIFY",
+            7,
+            "TXN123456789",
+            "amount",
+        )
+        messages = "\n".join(logs.output)
+        self.assertIn("expected_amount=1.14", messages)
+        self.assertIn("received_amount=1.14", messages)
+        self.assertIn("amount_match=True", messages)
+        self.assertIn("final_match=True", messages)
+        self.assertNotIn("email_amount_precision", messages)
+        self.assertNotIn("exact_comparison_result", messages)
+
+    def test_exact_amount_is_compared_to_stored_final_qr_amount(self):
         with self.assertLogs(payment.logger, level="INFO") as logs:
             result, claim = self._verify_email("1.07", "1.07")
 
@@ -288,9 +320,9 @@ class FamAppQrTests(unittest.TestCase):
         self.assertIn("stored_decimal_adjustment=<none>", messages)
         self.assertIn("stored_final_qr_amount=1.07", messages)
         self.assertIn("received_amount=1.07", messages)
-        self.assertIn("exact_comparison_result=True", messages)
         self.assertIn("amount_match=True", messages)
         self.assertNotIn("decimal_amount_match=", messages)
+        self.assertNotIn("exact_comparison_result", messages)
 
     def test_decimal_fallback_does_not_require_a_usable_payment_purpose(self):
         result, claim = self._verify_email("149.23", "149.23", purpose="not-a-valid-purpose")
@@ -302,17 +334,17 @@ class FamAppQrTests(unittest.TestCase):
             "amount",
         )
 
-    def test_wrong_or_rounded_decimal_email_does_not_verify(self):
+    def test_different_amount_fails_but_numeric_scale_does_not_matter(self):
         with self.assertLogs(payment.logger, level="INFO") as logs:
             wrong_result, wrong_claim = self._verify_email("149.23", "149.00")
-            rounded_result, rounded_claim = self._verify_email("149.20", "149.2")
+            scale_result, scale_claim = self._verify_email("149.20", "149.2")
         self.assertEqual(wrong_result, "pending")
-        self.assertEqual(rounded_result, "pending")
+        self.assertEqual(scale_result, "success")
         wrong_claim.assert_not_awaited()
-        rounded_claim.assert_not_awaited()
+        scale_claim.assert_awaited_once()
         messages = "\n".join(logs.output)
-        self.assertIn("email_amount_does_not_match_final_qr_amount", messages)
-        self.assertIn("email_amount_precision_not_two", messages)
+        self.assertIn("amount_match=False", messages)
+        self.assertNotIn("email_amount_precision", messages)
 
     def test_duplicate_transaction_claim_is_rejected(self):
         result, claim = self._verify_email("149.23", "149.23", claim=False)
@@ -335,7 +367,56 @@ class FamAppQrTests(unittest.TestCase):
 
         self.assertFalse(asyncio.run(claim_duplicate()))
 
-    def test_missing_transaction_and_ambiguous_amount_stay_pending(self):
+    def test_transaction_claim_requires_an_unused_id_for_the_order(self):
+        async def claim_once():
+            find_one_and_update = AsyncMock(return_value=None)
+            with patch.object(database._orders, "find_one_and_update", new=find_one_and_update):
+                result = await database.claim_famapp_payment(
+                    "ORD-OTHER",
+                    7,
+                    "TXN123456789",
+                    "amount",
+                )
+            return result, find_one_and_update
+
+        result, find_one_and_update = asyncio.run(claim_once())
+        self.assertFalse(result)
+        query = find_one_and_update.await_args.args[0]
+        self.assertEqual(query["$and"][0], {"famapp_transaction_id": {"$exists": False}})
+
+    def test_active_famapp_order_lookup_compares_final_amounts(self):
+        now = datetime.now(timezone.utc)
+        records = [
+            {
+                "_id": "ORD-MATCH",
+                "payment_provider": "famapp",
+                "famapp_qr_amount": "149.260",
+                "created_at": now - timedelta(minutes=2),
+                "expires_at": now + timedelta(minutes=10),
+            },
+            {
+                "_id": "ORD-EXPIRED",
+                "payment_provider": "famapp",
+                "final_price": "149.26",
+                "created_at": now - timedelta(minutes=2),
+                "expires_at": now - timedelta(seconds=1),
+            },
+        ]
+
+        async def records_cursor():
+            for record in records:
+                yield record
+
+        async def find_active():
+            with patch.object(database._orders, "find", return_value=records_cursor()):
+                return await database.get_active_famapp_orders_for_amount(
+                    payment.Decimal("149.26")
+                )
+
+        matches = asyncio.run(find_active())
+        self.assertEqual([order["_id"] for order in matches], ["ORD-MATCH"])
+
+    def test_missing_transaction_stays_pending_and_extracted_subject_amount_is_used(self):
         missing_tx, missing_tx_claim = self._verify_email(
             "149.23",
             "149.23",
@@ -347,9 +428,61 @@ class FamAppQrTests(unittest.TestCase):
             extra_text="Updated balance: ₹500.00\n",
         )
         self.assertEqual(missing_tx, "pending")
-        self.assertEqual(ambiguous, "pending")
+        self.assertEqual(ambiguous, "success")
         missing_tx_claim.assert_not_awaited()
-        ambiguous_claim.assert_not_awaited()
+        ambiguous_claim.assert_awaited_once()
+
+    def test_multiple_active_amount_matches_without_purpose_remain_pending(self):
+        result, claim = self._verify_email(
+            "149.23",
+            "149.23",
+            active_orders=[
+                {"_id": "ORD-DECIMAL-VERIFY", "payment_purpose": "FAP20261120ABC123"},
+                {"_id": "ORD-OTHER", "payment_purpose": "FAP20261120XYZ789"},
+            ],
+        )
+        self.assertEqual(result, "pending")
+        claim.assert_not_awaited()
+
+    def test_multiple_active_amount_matches_can_be_disambiguated_by_purpose(self):
+        result, claim = self._verify_email(
+            "149.23",
+            "149.23",
+            purpose="FAP20261120ABC123",
+            active_orders=[
+                {"_id": "ORD-DECIMAL-VERIFY", "payment_purpose": "FAP20261120ABC123"},
+                {"_id": "ORD-OTHER", "payment_purpose": "FAP20261120XYZ789"},
+            ],
+        )
+        self.assertEqual(result, "success")
+        claim.assert_awaited_once()
+
+    def test_invalid_incoming_email_is_rejected(self):
+        message = EmailMessage()
+        message["From"] = "no-reply@famapp.in"
+        message["Subject"] = "Your FamX account update"
+        message["Date"] = format_datetime(datetime.now(timezone.utc))
+        message.set_content("You have successfully received ₹149.23")
+        result, claim = self._verify_email(
+            "149.23", "149.23", raw_email=bytes(message)
+        )
+        self.assertEqual(result, "pending")
+        claim.assert_not_awaited()
+
+    def test_invalid_email_timestamp_is_rejected(self):
+        message = EmailMessage()
+        message["From"] = "no-reply@famapp.in"
+        message["Subject"] = "You received ₹149.23 in your FamX account"
+        message["Date"] = "not a valid date"
+        message.set_content(
+            "You have successfully received ₹149.23\n"
+            "Transaction ID: TXN123456789\n"
+        )
+        result, claim = self._verify_email(
+            "149.23", "149.23", raw_email=bytes(message)
+        )
+        self.assertEqual(result, "pending")
+        claim.assert_not_awaited()
 
     def test_expired_orders_and_out_of_window_emails_do_not_claim_transactions(self):
         now = datetime.now(timezone.utc)
@@ -479,6 +612,11 @@ class FamAppQrTests(unittest.TestCase):
 
         with (
             patch.object(payment, "get_order", new=AsyncMock(return_value=order)),
+            patch.object(
+                payment,
+                "get_active_famapp_orders_for_amount",
+                new=AsyncMock(return_value=[{"_id": "ORD-GENERATED", "payment_purpose": purpose}]),
+            ),
             patch.object(payment, "imaplib") as imaplib,
             patch.object(payment, "IMAP_USERNAME", "test@example.com"),
             patch.object(payment, "IMAP_APP_PASSWORD", "test-password"),
