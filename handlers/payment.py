@@ -1143,7 +1143,6 @@ async def _send_payment_screen(
         "⌛ <b>Validity:</b> {plan_validity}\n\n"
         "📲 Scan the QR code above using any UPI app.\n\n"
         "✅ <b>Pay ₹{final_price_str}</b> by scanning the <b>QR Code</b> above.\n"
-        "ℹ️ The QR contains a small automatic verification adjustment. Pay the amount pre-filled by the QR without editing it.\n"
         "✅ After paying, tap <b>Check Payment Status</b> — your plan unlocks instantly once the payment is confirmed.\n\n"
         "🆔 <b>Order:</b> #{order_id}"
     )
@@ -1161,11 +1160,6 @@ async def _send_payment_screen(
     except (KeyError, ValueError, IndexError):
         logger.warning("payment_message template is malformed — using default")
         payment_msg_text = _default_tpl.format(**_fmt_kwargs)
-    if "automatic verification adjustment" not in payment_msg_text.lower():
-        payment_msg_text += (
-            "\n\nℹ️ The QR contains a small automatic verification adjustment. "
-            "Pay the amount pre-filled by the QR without editing it."
-        )
 
     # Send FamApp QR image and capture its message ID.
     qr_data = BytesIO(famapp_qr_bytes)
@@ -1331,7 +1325,6 @@ async def _restore_existing_payment_screen(
         "⌛ <b>Validity:</b> {plan_validity}\n\n"
         "📲 Scan the QR code above using any UPI app.\n\n"
         "✅ <b>Pay ₹{final_price_str}</b> by scanning the <b>QR Code</b> above.\n"
-        "ℹ️ The QR contains a small automatic verification adjustment. Pay the amount pre-filled by the QR without editing it.\n"
         "✅ After paying, tap <b>Check Payment Status</b> — your plan unlocks instantly once the payment is confirmed.\n\n"
         "🆔 <b>Order:</b> #{order_id}"
     )
@@ -1348,11 +1341,6 @@ async def _restore_existing_payment_screen(
         payment_text = template.format(**format_args)
     except (KeyError, ValueError, IndexError):
         payment_text = default_tpl.format(**format_args)
-    if "automatic verification adjustment" not in payment_text.lower():
-        payment_text += (
-            "\n\nℹ️ The QR contains a small automatic verification adjustment. "
-            "Pay the amount pre-filled by the QR without editing it."
-        )
 
     qr_message_id = None
     if qr_bytes:
